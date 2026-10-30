@@ -395,11 +395,12 @@ MAX_LOSSES_PER_DAY = int(_env_f("MAX_LOSSES_PER_DAY", 0))     # optional: pause 
 ORDER_MAX_AGE_H = _env_f("ORDER_MAX_AGE_H", 12)               # unfilled entry orders older than this get cancelled
 MIN_TURNOVER_USD = _env_f("MIN_TURNOVER_USD", 5_000_000)      # 24h volume floor
 MAX_SPREAD_PCT = _env_f("MAX_SPREAD_PCT", 0.3)
-MIN_RR = _env_f("MIN_RR", 1.5)
+MIN_RR = _env_f("MIN_RR", 1.2)
 MAX_STOP_PCT = _env_f("MAX_STOP_PCT", 15)
 
 # --- v8 rule constants
-MIN_STOP_ATR = 2.5                       # stop >= 2.5 x ATR(1h), both tactics
+MIN_STOP_ATR = 1.5                       # stop >= 1.5 x ATR(1h), both tactics
+MIN_STOP_4H_FRAC = 0.7                   # tactic 1: stop >= 0.7 x typical 4h candle range
 ENTRY_MAX_ATR = {1: 1.5, 2: 4.0}         # entry must be within this many ATR(1h) of last price
 TREND_MIN_DIST_PCT = 1.0                 # tactic 1: last must be >=1% beyond EMA200(4h) in trade direction
 FUNDING_EXTREME_4H_PCT = 0.1             # skip the side that pays >0.1% funding per 4h
@@ -766,8 +767,8 @@ def check_plan(c, p):
     if tactic == 1:
         if c["range4h"] is None:
             problems.append("not enough 4h candles for the typical 4h range")
-        elif sd < c["range4h"]:
-            problems.append(f"tactic 1: stop distance {sd:.6g} is below the typical 4h candle range {c['range4h']:.6g}")
+        elif sd < MIN_STOP_4H_FRAC * c["range4h"]:
+            problems.append(f"tactic 1: stop distance {sd:.6g} is below {MIN_STOP_4H_FRAC} x typical 4h candle range = {MIN_STOP_4H_FRAC * c['range4h']:.6g}")
     if entry > 0 and sd / entry * 100 > MAX_STOP_PCT:
         problems.append(f"stop is {sd / entry * 100:.1f}% from entry (max {MAX_STOP_PCT:g}%)")
     rr = abs(tp - entry) / sd if sd > 0 else 0
