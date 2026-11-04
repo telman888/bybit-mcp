@@ -401,7 +401,9 @@ MAX_STOP_PCT = _env_f("MAX_STOP_PCT", 15)
 # --- v8 rule constants
 MIN_STOP_ATR = 1.5                       # stop >= 1.5 x ATR(1h), both tactics
 MIN_STOP_4H_FRAC = 0.7                   # tactic 1: stop >= 0.7 x typical 4h candle range
-ENTRY_MAX_ATR = {1: 1.5, 2: 4.0}         # entry must be within this many ATR(1h) of last price
+ENTRY_MAX_ATR = {1: 1.5, 2: 4.0, 3: 1.0}  # entry must be within this many ATR(1h) of last price
+MIN_STOP_ATR_T3 = 1.0                    # tactic 3 (scalp): stop >= 1.0 x ATR(1h)
+MAX_STOP_PCT_T3 = 6.0                    # tactic 3 (scalp): stop at most 6% from entry
 TREND_MIN_DIST_PCT = 1.0                 # tactic 1: last must be >=1% beyond EMA200(4h) in trade direction
 FUNDING_EXTREME_4H_PCT = 0.1             # skip the side that pays >0.1% funding per 4h
 FRESH_PEAK_HOURS = 3                     # tactic 2: peak made < 3h ago counts as "still rising"
@@ -697,8 +699,8 @@ def check_plan(c, p):
     entry, sl, tp = float(entry_d), float(sl_d), float(tp_d)
     last, bid, ask, atr, inst = c["last"], c["bid"], c["ask"], c["atr1h"], c["inst"]
 
-    if tactic not in (1, 2):
-        problems.append("tactic must be 1 or 2")
+    if tactic not in (1, 2, 3):
+        problems.append("tactic must be 1, 2 or 3")
     if tactic == 2 and not short:
         problems.append("tactic 2 is short-only")
     lab = _blackout_label(c["now"])
@@ -762,15 +764,17 @@ def check_plan(c, p):
         dist_atr = abs(entry - last) / atr
         if tactic in ENTRY_MAX_ATR and dist_atr > ENTRY_MAX_ATR[tactic]:
             problems.append(f"entry is {dist_atr:.1f} ATR(1h) from price (max {ENTRY_MAX_ATR[tactic]} for tactic {tactic})")
-        if sd < MIN_STOP_ATR * atr:
-            problems.append(f"stop distance {sd:.6g} is below {MIN_STOP_ATR} x ATR(1h) = {MIN_STOP_ATR * atr:.6g}")
+        min_stop_atr = MIN_STOP_ATR_T3 if tactic == 3 else MIN_STOP_ATR
+        if sd < min_stop_atr * atr:
+            problems.append(f"stop distance {sd:.6g} is below {min_stop_atr} x ATR(1h) = {min_stop_atr * atr:.6g}")
     if tactic == 1:
         if c["range4h"] is None:
             problems.append("not enough 4h candles for the typical 4h range")
         elif sd < MIN_STOP_4H_FRAC * c["range4h"]:
             problems.append(f"tactic 1: stop distance {sd:.6g} is below {MIN_STOP_4H_FRAC} x typical 4h candle range = {MIN_STOP_4H_FRAC * c['range4h']:.6g}")
-    if entry > 0 and sd / entry * 100 > MAX_STOP_PCT:
-        problems.append(f"stop is {sd / entry * 100:.1f}% from entry (max {MAX_STOP_PCT:g}%)")
+    max_stop_pct = min(MAX_STOP_PCT, MAX_STOP_PCT_T3) if tactic == 3 else MAX_STOP_PCT
+    if entry > 0 and sd / entry * 100 > max_stop_pct:
+        problems.append(f"stop is {sd / entry * 100:.1f}% from entry (max {max_stop_pct:g}%)")
     rr = abs(tp - entry) / sd if sd > 0 else 0
     if rr < MIN_RR:
         problems.append(f"reward:risk {rr:.2f} is below {MIN_RR}")
@@ -932,7 +936,7 @@ async def trade_status() -> dict:
 @safe
 async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float,
                             tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
-    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 7% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend) or 2 (fade shorts). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why."""
+    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 7% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 1 ATR(1h) and <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why."""
     _guard_account()
     s, side_n, tactic = _sym(symbol), _norm_side(side), int(tactic)
     if not dry_run and not TRADING_ENABLED:
