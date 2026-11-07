@@ -10,7 +10,7 @@ PART 2 - trading tools (trade_*): only active when BYBIT_API_KEY / BYBIT_API_SEC
   * the only way to open a position is a plain PostOnly LIMIT order with a mandatory stop-loss
     and take-profit attached. Size is computed here from the stop distance: the loss if the stop
     is hit is at most 7% of capital, up to 5 positions at once, exchange leverage 5-10x.
-    Optional LOSS HALT (env HALT_DRAWDOWN_PCT, default 0 = off): capital down that % from its peak =
+    Optional LOSS HALT (env LOSS_HALT_PCT, default 0 = off): capital down that % from its peak =
     no new entries, resting orders are pulled, the owner is notified.
     Every rule (risk, leverage, max open, loss halt, ATR stop, trend filter, news blackout)
     is checked in code, not in the prompt.
@@ -390,7 +390,7 @@ RISK_USD = _env_f("RISK_USD", 0)                              # optional extra $
 MAX_OPEN = max(1, min(int(_env_f("MAX_OPEN", 5)), 5))         # positions + resting entry orders; 5 is the hard ceiling
 MAX_LEVERAGE = max(5.0, min(_env_f("MAX_LEVERAGE", 10), 10))  # exchange leverage is set between MIN and MAX; total notional <= capital * MAX
 MIN_LEVERAGE = max(1.0, min(_env_f("MIN_LEVERAGE", 5), MAX_LEVERAGE))
-HALT_DRAWDOWN_PCT = _env_f("HALT_DRAWDOWN_PCT", 0)            # optional: capital down this % from its peak = STOP new entries; 0 = off (owner 07.11.2026: keep trading to win it back)
+HALT_DRAWDOWN_PCT = _env_f("LOSS_HALT_PCT", 0)                # optional: capital down this % from its peak = STOP new entries; 0 = off. Old env HALT_DRAWDOWN_PCT is ignored (owner 07.11.2026: keep trading to win it back)
 MAX_LOSSES_PER_DAY = int(_env_f("MAX_LOSSES_PER_DAY", 0))     # optional: pause after N losing closes per UTC day, 0 = off
 ORDER_MAX_AGE_H = _env_f("ORDER_MAX_AGE_H", 12)               # unfilled entry orders older than this get cancelled
 MIN_TURNOVER_USD = _env_f("MIN_TURNOVER_USD", 5_000_000)      # 24h volume floor
@@ -899,7 +899,7 @@ def _blocked_reasons(a, now):
 
 
 def _halted(acc) -> bool:
-    """Loss halt is on only when HALT_DRAWDOWN_PCT > 0 (default 0 = off)."""
+    """Loss halt is on only when LOSS_HALT_PCT > 0 (default 0 = off)."""
     return HALT_DRAWDOWN_PCT > 0 and acc["drawdown_pct"] >= HALT_DRAWDOWN_PCT
 
 
@@ -907,7 +907,7 @@ def _halted(acc) -> bool:
 @mcp.tool()
 @safe
 async def trade_status() -> dict:
-    """START HERE. Trading environment (demo/real), capital and drawdown, open positions (with stop-loss), resting entry orders, today's PnL, limits, and whether a new entry is allowed right now (blocked_reasons). If loss_halt/notify_owner is true (only when HALT_DRAWDOWN_PCT is set on the host): capital is down that % from its peak, send the owner a push notification and wait for his instructions. Read-only."""
+    """START HERE. Trading environment (demo/real), capital and drawdown, open positions (with stop-loss), resting entry orders, today's PnL, limits, and whether a new entry is allowed right now (blocked_reasons). If loss_halt/notify_owner is true (only when LOSS_HALT_PCT is set on the host): capital is down that % from its peak, send the owner a push notification and wait for his instructions. Read-only."""
     try:
         _guard_account()
     except Refused as e:
