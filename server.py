@@ -7,8 +7,9 @@ PART 2 - trading tools (trade_*): only active when BYBIT_API_KEY / BYBIT_API_SEC
     BYBIT_ENV=real AND ALLOW_REAL=yes.
   * trading tools refuse to run unless MCP_SECRET (>=16 chars) is set, because the URL
     is the only password protecting this server.
-  * the only way to open a position is a plain PostOnly LIMIT order with a mandatory stop-loss
-    and take-profit attached. Size is computed here from the stop distance: the loss if the stop
+  * the only ways to open a position are a plain PostOnly LIMIT order, or a BREAKOUT entry
+    (conditional limit that fires when a level breaks, worst fill capped at 0.15 ATR beyond the
+    trigger), both with a mandatory stop-loss and take-profit attached. Size is computed here from the stop distance: the loss if the stop
     is hit is at most 7% of capital, up to 5 positions at once, exchange leverage 5-10x.
     Optional LOSS HALT (env LOSS_HALT_PCT, default 0 = off): capital down that % from its peak =
     no new entries, resting orders are pulled, the owner is notified.
@@ -30,7 +31,7 @@ import re
 import statistics
 import time
 from datetime import datetime, timezone
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -47,7 +48,7 @@ mcp = FastMCP(
     "bybit-guarded-trader",
     instructions=(
         "Bybit USDT perpetuals (category=linear). bybit_* tools: public market data. "
-        "trade_* tools: guarded trading (plain PostOnly limit entries with mandatory SL/TP, risk-sized by the server; "
+        "trade_* tools: guarded trading (PostOnly limit entries or capped breakout entries with mandatory SL/TP, risk-sized by the server; "
         "demo by default). Call trade_status first; call trade_housekeeping at the start of every scheduled run. "
         "Funding rates are per funding interval (see funding_interval_h)."
     ),
@@ -409,6 +410,7 @@ FUNDING_EXTREME_4H_PCT = 0.1             # skip the side that pays >0.1% funding
 FRESH_PEAK_HOURS = 3                     # tactic 2: peak made < 3h ago counts as "still rising"
 PEAK_NO_GO_PCT = 10                      # ...and entry must then be >=10% below that peak
 ENTRY_STATUSES = ("New", "PartiallyFilled", "Filled", "PartiallyFilledCanceled")
+BREAKOUT_SLIP_ATR = 0.15                 # breakout entry: worst fill is at most this many ATR(1h) beyond the trigger (limit price)
 
 # --- no-trade windows around big macro events (UTC). Add more with env NO_TRADE_WINDOWS="start/end,start/end"
 DEFAULT_BLACKOUTS = [
@@ -550,8 +552,9 @@ def _day_start_ms():
 
 
 def _is_entry_order(o):
+    # "Stop" = our own conditional (breakout) entry; TP/SL orders are reduce-only and have other stopOrderType values
     return (str(o.get("reduceOnly")).lower() != "true" and str(o.get("closeOnTrigger")).lower() != "true"
-            and (o.get("stopOrderType") or "") in ("", "UNKNOWN"))
+            and (o.get("stopOrderType") or "") in ("", "UNKNOWN", "Stop"))
 
 
 def _pos_row(p):
@@ -564,9 +567,15 @@ def _pos_row(p):
 
 
 def _order_row(o):
-    return {"order_id": o.get("orderId"), "symbol": o.get("symbol"), "side": o.get("side"),
-            "price": _f(o.get("price")), "qty": _f(o.get("qty")), "status": o.get("orderStatus"),
-            "age_h": _age_h(o.get("createdTime")), "link_id": o.get("orderLinkId")}
+    row = {"order_id": o.get("orderId"), "symbol": o.get("symbol"), "side": o.get("side"),
+           "price": _f(o.get("price")), "qty": _f(o.get("qty")), "status": o.get("orderStatus"),
+           "age_h": _age_h(o.get("createdTime")), "link_id": o.get("orderLinkId")}
+    if (_f(o.get("triggerPrice")) or 0) > 0:
+        row["type"] = "breakout"
+        row["trigger_price"] = _f(o.get("triggerPrice"))
+    else:
+        row["type"] = "limit"
+    return row
 
 
 async def _wallet():
@@ -731,11 +740,19 @@ def check_plan(c, p):
     same_side = (sum(1 for x in c["positions"] if x.get("side") == side)
                  + sum(1 for o in c["orders"] if o.get("side") == side))
 
-    # price logic (plain limit, PostOnly, protective SL and TP on the right sides)
-    if short:
+    # price logic (plain limit, PostOnly, protective SL and TP on the right sides).
+    # breakout entry: `entry` is the trigger; sell triggers BELOW the market, buy ABOVE (enter when the move has started)
+    breakout = bool(p.get("breakout"))
+    if breakout and short:
+        if not entry < last:
+            problems.append(f"breakout sell trigger {entry} must be BELOW last price {last}")
+    elif breakout:
         if not entry > last:
+            problems.append(f"breakout buy trigger {entry} must be ABOVE last price {last}")
+    if short:
+        if not breakout and not entry > last:
             problems.append(f"limit sell {entry} must be ABOVE last price {last}")
-        if bid and not entry > bid:
+        if not breakout and bid and not entry > bid:
             problems.append(f"limit sell {entry} must be above best bid {bid}")
         if sl <= 0:
             problems.append("stop-loss is mandatory")
@@ -744,9 +761,9 @@ def check_plan(c, p):
         if not tp < entry:
             problems.append("take-profit must be below entry for a short")
     else:
-        if not entry < last:
+        if not breakout and not entry < last:
             problems.append(f"limit buy {entry} must be BELOW last price {last}")
-        if ask and not entry < ask:
+        if not breakout and ask and not entry < ask:
             problems.append(f"limit buy {entry} must be below best ask {ask}")
         if sl <= 0:
             problems.append("stop-loss is mandatory")
@@ -756,6 +773,11 @@ def check_plan(c, p):
             problems.append("take-profit must be above entry for a long")
     sd_d = abs(entry_d - sl_d)
     sd = float(sd_d)
+    # size from the WORST fill: for a breakout the fill can be up to the limit price, beyond the trigger
+    lim_d = Decimal(str(p["limit"])) if breakout and p.get("limit") is not None else entry_d
+    if breakout and ((short and lim_d > entry_d) or (not short and lim_d < entry_d)):
+        problems.append("breakout limit price must be beyond the trigger in the trade direction")
+    sd_size_d = max(abs(lim_d - sl_d), sd_d)
 
     # ATR-based rules
     if atr is None:
@@ -813,7 +835,7 @@ def check_plan(c, p):
         if RISK_USD > 0:
             cap = min(cap, RISK_USD)
         risk = min(p.get("risk_req") or cap, cap)
-        stop_pct = sd / entry * 100
+        stop_pct = float(sd_size_d) / entry * 100
         # leverage that still leaves the liquidation price (about 100/lev - 1 % away, isolated margin) beyond the stop with a 20% margin
         lev_cap = min(int(MAX_LEVERAGE), int(100 // (stop_pct * 1.2 + 1.0)))
         if lev_cap < int(MIN_LEVERAGE):
@@ -837,9 +859,9 @@ def check_plan(c, p):
         if margin_room <= 0:
             problems.append("no free margin left")
         cap_notional = max(min(room, margin_room), 0)
-        qty = min(Decimal(str(max(risk, 0))) / sd_d, Decimal(str(cap_notional)) / entry_d, max_qty)
+        qty = min(Decimal(str(max(risk, 0))) / sd_size_d, Decimal(str(cap_notional)) / max(entry_d, lim_d), max_qty)
         qty = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-        notional = float(qty * entry_d)
+        notional = float(qty * max(entry_d, lim_d))
         if qty < min_qty or Decimal(str(notional)) < min_notional:
             problems.append(f"size too small: risk ${risk:.2f} / stop distance {sd:.6g} gives qty {qty} (min {min_qty}, min notional ${min_notional}); stop is too wide for this risk")
         margin_base = min(eff_eq, c["available"]) if c["available"] is not None else eff_eq
@@ -856,11 +878,11 @@ def check_plan(c, p):
             problems.append(f"needs {lev}x but the coin allows {max_lev:g}x")
         if c["available"] is not None and notional / lev > c["available"] * 0.95:
             problems.append(f"not enough available margin: need ${notional / lev:,.2f}, have ${c['available']:,.2f}")
-        if qty >= min_qty and float(qty * sd_d) < 0.7 * risk:
-            warnings.append(f"size was cut by the leverage/margin limits: real risk ${float(qty * sd_d):.2f} instead of ${risk:.2f}")
+        if qty >= min_qty and float(qty * sd_size_d) < 0.7 * risk:
+            warnings.append(f"size was cut by the leverage/margin limits: real risk ${float(qty * sd_size_d):.2f} instead of ${risk:.2f}")
         sizing = {
             "qty": _s(qty), "notional_usd": round(notional, 2), "leverage": lev,
-            "risk_usd_if_stopped": round(float(qty * sd_d), 2), "risk_budget_usd": round(risk, 2),
+            "risk_usd_if_stopped": round(float(qty * sd_size_d), 2), "risk_budget_usd": round(risk, 2),
             "reward_usd_if_tp": round(float(qty * abs(tp_d - entry_d)), 2), "rr": round(rr, 2),
             "capital_used_for_sizing_usd": round(eff_eq, 2), "stop_pct": round(stop_pct, 2),
         }
@@ -945,7 +967,19 @@ async def trade_status() -> dict:
 @safe
 async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float,
                             tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
-    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 7% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 1 ATR(1h) and <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why."""
+    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 7% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 1 ATR(1h) and <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why. For entering WHEN a level breaks (sell below / buy above the market) use trade_place_breakout."""
+    return await _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout=False)
+
+
+@mcp.tool()
+@safe
+async def trade_place_breakout(symbol: str, side: str, trigger: float, stop_loss: float, take_profit: float,
+                               tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
+    """Place ONE breakout entry: a conditional order that enters only when the price BREAKS a level in the trade direction (Sell: trigger BELOW the market, e.g. just under the day low; Buy: trigger ABOVE the market). When last price crosses the trigger, a limit order is sent with its price at most 0.15 ATR(1h) beyond the trigger, so slippage is capped (it is never an unlimited market order); if the price gaps past that limit, the order rests and housekeeping cancels it with the other stale entries. Stop-loss and take-profit are attached. Same rules as trade_place_limit (trigger within the tactic's ATR distance, stop >= ATR rule, reward:risk >= 1.2, one order per symbol, sizing from the WORST fill so the loss at the stop stays within the risk). dry_run=true validates and sizes without sending anything. Fees: the fill is a taker fill (higher fee than a maker limit)."""
+    return await _place(symbol, side, trigger, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout=True)
+
+
+async def _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout):
     _guard_account()
     s, side_n, tactic = _sym(symbol), _norm_side(side), int(tactic)
     if not dry_run and not TRADING_ENABLED:
@@ -953,10 +987,17 @@ async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: flo
     acct, mkt = await asyncio.gather(_account_state(need_history=(tactic == 2)), _market_ctx(s, tactic))
     tick = Decimal(mkt["inst"]["priceFilter"]["tickSize"])
     e_d, sl_d, tp_d = _q(entry, tick), _q(stop_loss, tick), _q(take_profit, tick)
-    plan = {"symbol": s, "side": side_n, "entry": e_d, "sl": sl_d, "tp": tp_d, "tactic": tactic, "risk_req": risk_usd}
+    lim_d = None
+    if breakout:
+        slip = Decimal(str((mkt["atr1h"] or 0) * BREAKOUT_SLIP_ATR))
+        lim_d = _q(e_d - slip, tick, ROUND_DOWN) if side_n == "Sell" else _q(e_d + slip, tick, ROUND_UP)
+    plan = {"symbol": s, "side": side_n, "entry": e_d, "sl": sl_d, "tp": tp_d, "tactic": tactic, "risk_req": risk_usd,
+            "breakout": breakout, "limit": lim_d}
     ctx = {**acct, **mkt, "now": datetime.now(timezone.utc)}
     chk = check_plan(ctx, plan)
     base = {"env": TRADE_ENV, "symbol": s, "side": side_n, "tactic": tactic, "entry": float(e_d),
+            "entry_type": "breakout" if breakout else "limit",
+            **({"trigger": float(e_d), "worst_fill_limit": float(lim_d)} if breakout else {}),
             "stop_loss": float(sl_d), "take_profit": float(tp_d),
             "context": {"last": mkt["last"], "atr_1h": mkt["atr1h"], "typical_4h_range": mkt["range4h"],
                         "ema200_4h": mkt["ema200_4h"], "funding_per_4h_pct": round(mkt["funding_4h_pct"], 4)}}
@@ -966,7 +1007,7 @@ async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: flo
     if dry_run:
         return {**base, "placed": False, "dry_run": True, "all_rules_pass": True, "sizing": sz, "warnings": chk["warnings"]}
 
-    link = f"v8t{tactic}-{s}-{int(time.time())}"[:36]
+    link = f"v8{'b' if breakout else 't'}{tactic}-{s}-{int(time.time())}"[:36]
     await bybit_signed("POST", "/v5/position/set-leverage", {
         "category": "linear", "symbol": s, "buyLeverage": str(sz["leverage"]), "sellLeverage": str(sz["leverage"])},
         ok_codes=(110043,))
@@ -976,6 +1017,10 @@ async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: flo
         "stopLoss": _s(sl_d), "takeProfit": _s(tp_d), "tpslMode": "Full",
         "slTriggerBy": "LastPrice", "tpTriggerBy": "LastPrice",
     }
+    if breakout:
+        # conditional limit: fires when last price crosses the trigger (2 = falls to/below, 1 = rises to/above)
+        body.update(price=_s(lim_d), triggerPrice=_s(e_d), triggerDirection=2 if side_n == "Sell" else 1,
+                    triggerBy="LastPrice", timeInForce="GTC")
     try:
         r = await bybit_signed("POST", "/v5/order/create", body)
         order_id = r.get("orderId")
@@ -996,6 +1041,8 @@ async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: flo
            "verified": {"order_status": status, "in_active_orders": active, "reject_reason": (o or {}).get("rejectReason"),
                         "open_positions_now": [x["symbol"] for x in after["positions"]],
                         "entry_orders_now": [x["symbol"] for x in after["orders"]]}}
+    if breakout and status == "Filled":
+        out["note"] = "The trigger was already crossed and the order filled at once: this is now an open position with its stop."
     if not out["placed"]:
         out["note"] = "The exchange did not keep the order (PostOnly orders are cancelled if they would execute immediately). Re-check price and retry next run."
     return out
