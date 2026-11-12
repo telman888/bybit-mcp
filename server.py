@@ -844,8 +844,12 @@ def check_plan(c, p):
             problems.append(f"size too small: risk ${risk:.2f} / stop distance {sd:.6g} gives qty {qty} (min {min_qty}, min notional ${min_notional}); stop is too wide for this risk")
         margin_base = min(eff_eq, c["available"]) if c["available"] is not None else eff_eq
         need = math.ceil(notional / (0.8 * margin_base)) if margin_base > 0 else 1
-        lev = int(max(int(MIN_LEVERAGE), min(max(lev_cap, 1), need)))
+        # owner 12.11.2026: always use the highest safe leverage (up to MAX_LEVERAGE, 10x) so each trade ties up less margin;
+        # the $ risk is unchanged (qty comes from the stop distance), and lev_cap keeps liquidation beyond the stop
         max_lev = _f((inst.get("leverageFilter") or {}).get("maxLeverage"))
+        lev = int(max(int(MIN_LEVERAGE), max(lev_cap, 1)))
+        if max_lev is not None and max_lev >= MIN_LEVERAGE:
+            lev = int(max(int(MIN_LEVERAGE), min(lev, int(max_lev))))
         if max_lev is not None and max_lev < MIN_LEVERAGE:
             problems.append(f"the coin allows only {max_lev:g}x leverage, below the minimum {int(MIN_LEVERAGE)}x")
         elif max_lev is not None and lev > max_lev:
