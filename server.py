@@ -10,7 +10,7 @@ PART 2 - trading tools (trade_*): only active when BYBIT_API_KEY / BYBIT_API_SEC
   * the only ways to open a position are a plain PostOnly LIMIT order, or a BREAKOUT entry
     (conditional limit that fires when a level breaks, worst fill capped at 0.15 ATR beyond the
     trigger), both with a mandatory stop-loss and take-profit attached. Size is computed here from the stop distance: the loss if the stop
-    is hit is at most 7% of capital, up to 5 positions at once, exchange leverage 5-10x.
+    is hit is at most 10% of capital, up to 5 positions at once, exchange leverage 5-10x.
     Optional LOSS HALT (env LOSS_HALT_PCT, default 0 = off): capital down that % from its peak =
     no new entries, resting orders are pulled, the owner is notified.
     Every rule (risk, leverage, max open, loss halt, ATR stop, trend filter, news blackout)
@@ -386,7 +386,7 @@ TRACKING_START = os.environ.get("TRACKING_START", "2026-10-26").strip()
 
 # --- limits (override with env vars on the host; hard ceilings protect against typos)
 ACCOUNT_BUDGET_USD = _env_f("ACCOUNT_BUDGET_USD", 100)       # starting capital: sizing never assumes more than budget + results so far
-MAX_RISK_PCT = min(_env_f("MAX_RISK_PCT", 7), 7)              # max loss per trade (stop hit) as % of capital; 7 is also the hard ceiling
+MAX_RISK_PCT = min(_env_f("MAX_RISK_PCT", 10), 10)            # max loss per trade (stop hit) as % of capital; 10 is also the hard ceiling (owner 14.11.2026: raised from 7)
 RISK_USD = _env_f("RISK_USD", 0)                              # optional extra $ cap per trade, 0 = off
 MAX_OPEN = max(1, min(int(_env_f("MAX_OPEN", 5)), 5))         # positions + resting entry orders; 5 is the hard ceiling
 MAX_LEVERAGE = max(5.0, min(_env_f("MAX_LEVERAGE", 10), 10))  # exchange leverage is set between MIN and MAX; total notional <= capital * MAX
@@ -967,7 +967,7 @@ async def trade_status() -> dict:
 @safe
 async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float,
                             tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
-    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 7% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 1 ATR(1h) and <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why. For entering WHEN a level breaks (sell below / buy above the market) use trade_place_breakout."""
+    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 10% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 1 ATR(1h) and <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why. For entering WHEN a level breaks (sell below / buy above the market) use trade_place_breakout."""
     return await _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout=False)
 
 
