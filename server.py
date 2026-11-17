@@ -403,8 +403,8 @@ MAX_STOP_PCT = _env_f("MAX_STOP_PCT", 15)
 MIN_STOP_ATR = 1.5                       # stop >= 1.5 x ATR(1h), both tactics
 MIN_STOP_4H_FRAC = 0.7                   # tactic 1: stop >= 0.7 x typical 4h candle range
 ENTRY_MAX_ATR = {1: 1.5, 2: 4.0, 3: 1.0}  # entry must be within this many ATR(1h) of last price
-MIN_STOP_ATR_T3 = _env_f("MIN_STOP_ATR_T3", 0.5)  # tactic 3 (scalp): stop >= 0.5 x ATR(1h) (owner 17.11: was 1.0, too wide for range swings)
-MIN_RR_T3 = _env_f("MIN_RR_T3", 0.8)            # tactic 3 (scalp): reward:risk >= 0.8 (owner 17.11: TP ~7-8% margin with stop ~8-9% is fine)
+MIN_STOP_ATR_T3 = _env_f("MIN_STOP_ATR_T3", 0)  # tactic 3: no ATR minimum for the stop (owner 17.11: stop goes where the analysis says; 0 = off)
+MIN_RR_T3 = _env_f("MIN_RR_T3", 0)              # tactic 3: no reward:risk minimum (owner 17.11: TP at the nearest target the analysis gives; 0 = off)
 MAX_STOP_PCT_T3 = 6.0                    # tactic 3 (scalp): stop at most 6% from entry
 TREND_MIN_DIST_PCT = 1.0                 # tactic 1: last must be >=1% beyond EMA200(4h) in trade direction
 FUNDING_EXTREME_4H_PCT = 0.1             # skip the side that pays >0.1% funding per 4h
@@ -788,7 +788,7 @@ def check_plan(c, p):
         if tactic in ENTRY_MAX_ATR and dist_atr > ENTRY_MAX_ATR[tactic]:
             problems.append(f"entry is {dist_atr:.1f} ATR(1h) from price (max {ENTRY_MAX_ATR[tactic]} for tactic {tactic})")
         min_stop_atr = MIN_STOP_ATR_T3 if tactic == 3 else MIN_STOP_ATR
-        if sd < min_stop_atr * atr:
+        if min_stop_atr > 0 and sd < min_stop_atr * atr:
             problems.append(f"stop distance {sd:.6g} is below {min_stop_atr} x ATR(1h) = {min_stop_atr * atr:.6g}")
     if tactic == 1:
         if c["range4h"] is None:
@@ -800,7 +800,7 @@ def check_plan(c, p):
         problems.append(f"stop is {sd / entry * 100:.1f}% from entry (max {max_stop_pct:g}%)")
     rr = abs(tp - entry) / sd if sd > 0 else 0
     min_rr = MIN_RR_T3 if tactic == 3 else MIN_RR
-    if rr < min_rr:
+    if min_rr > 0 and rr < min_rr:
         problems.append(f"reward:risk {rr:.2f} is below {min_rr}")
 
     # tactic 1: trade only with the 4h EMA200 trend
@@ -969,7 +969,7 @@ async def trade_status() -> dict:
 @safe
 async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: float, take_profit: float,
                             tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
-    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 10% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop >= 0.5 ATR(1h) and <= 6%, reward:risk >= 0.8, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why. For entering WHEN a level breaks (sell below / buy above the market) use trade_place_breakout."""
+    """Place ONE plain PostOnly limit entry (Buy below / Sell above the market) with stop-loss and take-profit attached. The server rounds prices, computes qty from the stop distance (loss if stopped is at most 10% of capital), sets leverage 5-10x, checks every rule and verifies the order is active. tactic: 1 (trend), 2 (fade shorts) or 3 (scalp: either side, near-term level, stop and take-profit placed by analysis: no ATR or reward:risk minimum, stop <= 6%, no EMA200 trend rule). risk_usd can only LOWER the default risk. dry_run=true validates and sizes without sending anything. If any rule fails, nothing is sent and `problems` lists why. For entering WHEN a level breaks (sell below / buy above the market) use trade_place_breakout."""
     return await _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout=False)
 
 
@@ -977,7 +977,7 @@ async def trade_place_limit(symbol: str, side: str, entry: float, stop_loss: flo
 @safe
 async def trade_place_breakout(symbol: str, side: str, trigger: float, stop_loss: float, take_profit: float,
                                tactic: int, risk_usd: Optional[float] = None, dry_run: bool = False) -> dict:
-    """Place ONE breakout entry: a conditional order that enters only when the price BREAKS a level in the trade direction (Sell: trigger BELOW the market, e.g. just under the day low; Buy: trigger ABOVE the market). When last price crosses the trigger, a limit order is sent with its price at most 0.15 ATR(1h) beyond the trigger, so slippage is capped (it is never an unlimited market order); if the price gaps past that limit, the order rests and housekeeping cancels it with the other stale entries. Stop-loss and take-profit are attached. Same rules as trade_place_limit (trigger within the tactic's ATR distance, stop >= ATR rule, reward:risk >= 1.2 (0.8 for tactic 3), one order per symbol, sizing from the WORST fill so the loss at the stop stays within the risk). dry_run=true validates and sizes without sending anything. Fees: the fill is a taker fill (higher fee than a maker limit)."""
+    """Place ONE breakout entry: a conditional order that enters only when the price BREAKS a level in the trade direction (Sell: trigger BELOW the market, e.g. just under the day low; Buy: trigger ABOVE the market). When last price crosses the trigger, a limit order is sent with its price at most 0.15 ATR(1h) beyond the trigger, so slippage is capped (it is never an unlimited market order); if the price gaps past that limit, the order rests and housekeeping cancels it with the other stale entries. Stop-loss and take-profit are attached. Same rules as trade_place_limit (trigger within the tactic's ATR distance, stop >= ATR rule, reward:risk >= 1.2 (none for tactic 3), one order per symbol, sizing from the WORST fill so the loss at the stop stays within the risk). dry_run=true validates and sizes without sending anything. Fees: the fill is a taker fill (higher fee than a maker limit)."""
     return await _place(symbol, side, trigger, stop_loss, take_profit, tactic, risk_usd, dry_run, breakout=True)
 
 
