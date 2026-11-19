@@ -412,6 +412,9 @@ FRESH_PEAK_HOURS = 3                     # tactic 2: peak made < 3h ago counts a
 PEAK_NO_GO_PCT = 10                      # ...and entry must then be >=10% below that peak
 ENTRY_STATUSES = ("New", "PartiallyFilled", "Filled", "PartiallyFilledCanceled")
 BREAKOUT_SLIP_ATR = 0.15                 # breakout entry: worst fill is at most this many ATR(1h) beyond the trigger (limit price)
+# owner 19.11.2026: no short in the bottom part of the 24h range, no long in the top part (no selling the day low / buying the day high).
+# 0.33 = shorts need entry >= 33% of the 24h range, longs <= 67%. Applies to limit AND breakout entries. 0 = off.
+DAY_EDGE_FRAC = max(0.0, min(_env_f("DAY_EDGE_FRAC", 0.33), 0.5))
 
 # --- no-trade windows around big macro events (UTC). Add more with env NO_TRADE_WINDOWS="start/end,start/end"
 DEFAULT_BLACKOUTS = [
@@ -693,6 +696,7 @@ async def _market_ctx(symbol, tactic):
     return {
         "inst": inst, "last": _f(tk.get("lastPrice")), "bid": _f(tk.get("bid1Price")), "ask": _f(tk.get("ask1Price")),
         "turnover24h": _f(tk.get("turnover24h")) or 0,
+        "high24h": _f(tk.get("highPrice24h")), "low24h": _f(tk.get("lowPrice24h")),
         "funding_4h_pct": (_f(tk.get("fundingRate")) or 0) * 100 * 4 / interval_h,
         "atr1h": _atr(c1), "peak": peak,
         "range4h": statistics.median([r[2] - r[3] for r in c4[-12:]]) if len(c4) >= 6 else None,
@@ -772,6 +776,14 @@ def check_plan(c, p):
             problems.append("stop-loss must be below entry for a long")
         if not tp > entry:
             problems.append("take-profit must be above entry for a long")
+    # day-edge rule: never short near the 24h low, never long near the 24h high
+    hi, lo = c.get("high24h"), c.get("low24h")
+    if DAY_EDGE_FRAC > 0 and hi and lo and hi > lo:
+        pos = (entry - lo) / (hi - lo)
+        if short and pos < DAY_EDGE_FRAC:
+            problems.append(f"short entry {entry} is at {pos * 100:.0f}% of the 24h range {lo}-{hi}: bottom {DAY_EDGE_FRAC * 100:.0f}% is a no-short zone (no selling the day low)")
+        if not short and pos > 1 - DAY_EDGE_FRAC:
+            problems.append(f"long entry {entry} is at {pos * 100:.0f}% of the 24h range {lo}-{hi}: top {DAY_EDGE_FRAC * 100:.0f}% is a no-long zone (no buying the day high)")
     sd_d = abs(entry_d - sl_d)
     sd = float(sd_d)
     # size from the WORST fill: for a breakout the fill can be up to the limit price, beyond the trigger
@@ -1002,7 +1014,10 @@ async def _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, 
             **({"trigger": float(e_d), "worst_fill_limit": float(lim_d)} if breakout else {}),
             "stop_loss": float(sl_d), "take_profit": float(tp_d),
             "context": {"last": mkt["last"], "atr_1h": mkt["atr1h"], "typical_4h_range": mkt["range4h"],
-                        "ema200_4h": mkt["ema200_4h"], "funding_per_4h_pct": round(mkt["funding_4h_pct"], 4)}}
+                        "ema200_4h": mkt["ema200_4h"], "funding_per_4h_pct": round(mkt["funding_4h_pct"], 4),
+                        "low24h": mkt["low24h"], "high24h": mkt["high24h"],
+                        "entry_pos_in_24h_range": (round((float(e_d) - mkt["low24h"]) / (mkt["high24h"] - mkt["low24h"]), 2)
+                                                   if mkt["high24h"] and mkt["low24h"] and mkt["high24h"] > mkt["low24h"] else None)}}
     if chk["problems"]:
         return {**base, "placed": False, "problems": chk["problems"], "warnings": chk["warnings"], "sizing": chk["sizing"]}
     sz = chk["sizing"]
