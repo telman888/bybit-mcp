@@ -415,6 +415,9 @@ BREAKOUT_SLIP_ATR = 0.15                 # breakout entry: worst fill is at most
 # owner 19.11.2026: no short in the bottom part of the 24h range, no long in the top part (no selling the day low / buying the day high).
 # 0.33 = shorts need entry >= 33% of the 24h range, longs <= 67%. Applies to limit AND breakout entries. 0 = off.
 DAY_EDGE_FRAC = max(0.0, min(_env_f("DAY_EDGE_FRAC", 0.33), 0.5))
+# owner 22.11.2026: measure that range over the last DAY_EDGE_HOURS 1h candles (incl. the forming one), not the
+# exchange's rolling 24h, so an old capitulation low/high does not mark the whole rebound as "the day high/low".
+DAY_EDGE_HOURS = max(1, min(int(_env_f("DAY_EDGE_HOURS", 12)), 24))
 
 # --- no-trade windows around big macro events (UTC). Add more with env NO_TRADE_WINDOWS="start/end,start/end"
 DEFAULT_BLACKOUTS = [
@@ -693,7 +696,10 @@ async def _market_ctx(symbol, tactic):
         i = max(range(len(window)), key=lambda j: window[j][2])
         peak = {"price": window[i][2], "hours_ago": len(window) - 1 - i}
     interval_h = _f(tk.get("fundingIntervalHour")) or 8
+    edge_win = c1_all[-DAY_EDGE_HOURS:]
     return {
+        "edge_high": max(r[2] for r in edge_win) if edge_win else None,
+        "edge_low": min(r[3] for r in edge_win) if edge_win else None,
         "inst": inst, "last": _f(tk.get("lastPrice")), "bid": _f(tk.get("bid1Price")), "ask": _f(tk.get("ask1Price")),
         "turnover24h": _f(tk.get("turnover24h")) or 0,
         "high24h": _f(tk.get("highPrice24h")), "low24h": _f(tk.get("lowPrice24h")),
@@ -776,14 +782,14 @@ def check_plan(c, p):
             problems.append("stop-loss must be below entry for a long")
         if not tp > entry:
             problems.append("take-profit must be above entry for a long")
-    # day-edge rule: never short near the 24h low, never long near the 24h high
-    hi, lo = c.get("high24h"), c.get("low24h")
+    # day-edge rule: never short near the recent low, never long near the recent high (last DAY_EDGE_HOURS, default 12h)
+    hi, lo = c.get("edge_high"), c.get("edge_low")
     if DAY_EDGE_FRAC > 0 and hi and lo and hi > lo:
         pos = (entry - lo) / (hi - lo)
         if short and pos < DAY_EDGE_FRAC:
-            problems.append(f"short entry {entry} is at {pos * 100:.0f}% of the 24h range {lo}-{hi}: bottom {DAY_EDGE_FRAC * 100:.0f}% is a no-short zone (no selling the day low)")
+            problems.append(f"short entry {entry} is at {pos * 100:.0f}% of the {DAY_EDGE_HOURS}h range {lo}-{hi}: bottom {DAY_EDGE_FRAC * 100:.0f}% is a no-short zone (no selling the day low)")
         if not short and pos > 1 - DAY_EDGE_FRAC:
-            problems.append(f"long entry {entry} is at {pos * 100:.0f}% of the 24h range {lo}-{hi}: top {DAY_EDGE_FRAC * 100:.0f}% is a no-long zone (no buying the day high)")
+            problems.append(f"long entry {entry} is at {pos * 100:.0f}% of the {DAY_EDGE_HOURS}h range {lo}-{hi}: top {DAY_EDGE_FRAC * 100:.0f}% is a no-long zone (no buying the day high)")
     sd_d = abs(entry_d - sl_d)
     sd = float(sd_d)
     # size from the WORST fill: for a breakout the fill can be up to the limit price, beyond the trigger
@@ -1017,7 +1023,10 @@ async def _place(symbol, side, entry, stop_loss, take_profit, tactic, risk_usd, 
                         "ema200_4h": mkt["ema200_4h"], "funding_per_4h_pct": round(mkt["funding_4h_pct"], 4),
                         "low24h": mkt["low24h"], "high24h": mkt["high24h"],
                         "entry_pos_in_24h_range": (round((float(e_d) - mkt["low24h"]) / (mkt["high24h"] - mkt["low24h"]), 2)
-                                                   if mkt["high24h"] and mkt["low24h"] and mkt["high24h"] > mkt["low24h"] else None)}}
+                                                   if mkt["high24h"] and mkt["low24h"] and mkt["high24h"] > mkt["low24h"] else None),
+                        f"edge_range_{DAY_EDGE_HOURS}h": [mkt["edge_low"], mkt["edge_high"]],
+                        "entry_pos_in_edge_range": (round((float(e_d) - mkt["edge_low"]) / (mkt["edge_high"] - mkt["edge_low"]), 2)
+                                                    if mkt["edge_high"] and mkt["edge_low"] and mkt["edge_high"] > mkt["edge_low"] else None)}}
     if chk["problems"]:
         return {**base, "placed": False, "problems": chk["problems"], "warnings": chk["warnings"], "sizing": chk["sizing"]}
     sz = chk["sizing"]
